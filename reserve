@@ -1,0 +1,99 @@
+# import fitz                            # PyMuPDF
+# from escpos.printer import Network
+# from PIL import Image, ImageFilter
+# import io
+
+# # PDF → Image → Thermal printer settings
+# PDF_FILE     = 'kot.pdf'
+# PRINTER_IP   = '192.168.0.87'
+# PRINTER_PORT = 9100
+# PRINTER_WIDTH = 576   # dots (80 mm paper)
+
+# # Oversampling factor (2–3): higher = more smoothing on downsample
+# ZOOM = 2
+
+# # Open PDF and printer
+# doc = fitz.open(PDF_FILE)
+# printer = Network(PRINTER_IP, PRINTER_PORT)
+
+# for page in doc:
+#     # 1) Render page at ZOOM× resolution
+#     mat = fitz.Matrix(ZOOM, ZOOM)
+#     pix = page.get_pixmap(matrix=mat)
+#     img = Image.open(io.BytesIO(pix.tobytes(output='png')))
+
+#     # 2) Grayscale
+#     img = img.convert('L')
+
+#     # 3) Resize down to printer width, with LANCZOS filter
+#     target_width = PRINTER_WIDTH
+#     wpercent = (target_width / float(img.width))
+#     hsize    = int(img.height * wpercent)
+#     img = img.resize((target_width, hsize), resample=Image.LANCZOS)
+
+#     # 4) Mild blur to smooth before threshold
+#     img = img.filter(ImageFilter.GaussianBlur(radius=0.8))
+
+#     # 5) Binarize at mid-level threshold
+#     img = img.point(lambda p: 0 if p < 128 else 255, mode='1')
+
+#     # 6) Print
+#     with io.BytesIO() as output:
+#         img.save(output, format='PNG')
+#         printer.image(io.BytesIO(output.getvalue()))
+
+#     printer.cut()
+
+# printer.close()
+
+
+import fitz                            # PyMuPDF
+from escpos.printer import Network
+from PIL import Image, ImageFilter, ImageEnhance
+import io
+
+# PDF → Image → Thermal printer settings
+PDF_FILE     = 'invoice.pdf'
+PRINTER_IP   = '192.168.0.87'
+PRINTER_PORT = 9100
+PRINTER_WIDTH = 576   # dots (80 mm paper)
+
+# Oversampling factor (2–3)
+ZOOM = 2
+
+doc = fitz.open(PDF_FILE)
+# printer = Network(PRINTER_IP, PRINTER_PORT)
+
+for page in doc:
+    # 1) Render at ZOOM× resolution
+    mat = fitz.Matrix(ZOOM, ZOOM)
+    pix = page.get_pixmap(matrix=mat)
+    img = Image.open(io.BytesIO(pix.tobytes(output='png')))
+
+    # 2) Grayscale
+    img = img.convert('L')
+
+    # 3) Resize down to printer width
+    wpercent = PRINTER_WIDTH / img.width
+    hsize    = int(img.height * wpercent)
+    img = img.resize((PRINTER_WIDTH, hsize), Image.LANCZOS)
+
+    # 4) Mild blur to smooth
+    img = img.filter(ImageFilter.GaussianBlur(radius=0.5))
+
+    # 5) Boost contrast
+    contrast = ImageEnhance.Contrast(img)
+    img = contrast.enhance(1.8)   # tweak 1.5–2.5 as needed
+
+    # 6) Binarize at threshold
+    THRESHOLD = 120  # lower value → stronger black
+    img = img.point(lambda p: 0 if p < THRESHOLD else 255, mode='1')
+
+    # 7) Print
+    with io.BytesIO() as output:
+        # img.save(output, format='PNG')
+        img.show()
+        # printer.image(io.BytesIO(output.getvalue()))
+    # printer.cut()
+
+# printer.close()
