@@ -186,3 +186,7 @@ print_queue.db*
 
 
 *.db*
+
+.venv
+
+venv
