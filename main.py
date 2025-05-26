@@ -2,166 +2,215 @@ from flask import Flask, request, jsonify
 import sqlite3, os, threading, time
 from werkzeug.utils import secure_filename
 import lib.printer as printer
-import argparse
 import uuid
+from flask_cors import CORS
 
 DB_PATH = "print_queue.db"
 PDF_DIR = "print_jobs"
+MAX_RETRIES = 3
 os.makedirs(PDF_DIR, exist_ok=True)
 
 app = Flask(__name__)
+CORS(app)
+
 # Event to wake the printer worker immediately on new jobs
 new_job_event = threading.Event()
 
-# Initialize the database with WAL mode and index for fast concurrency
+
 def init_db():
+    """
+    Initialize or migrate the database to include retry columns.
+    """
     with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
-        # Enable WAL for concurrent reads/writes
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        # Create table and index
-        conn.execute('''
+        # Create table if not exists
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS print_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT NOT NULL,
-                printer_ip TEXT NOT NULL,
-                printer_port INTEGER NOT NULL,
-                printer_width INTEGER DEFAULT 576,
-                threshold INTEGER DEFAULT 100,
-                feed_lines INTEGER DEFAULT 1,
-                zoom REAL DEFAULT 2.0,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              id               INTEGER PRIMARY KEY AUTOINCREMENT,
+              file_path        TEXT    NOT NULL,
+              connection_type  TEXT    NOT NULL CHECK(connection_type IN ('network','usb')),
+              printer_ip       TEXT,
+              printer_port     INTEGER,
+              usb_vendor_id    INTEGER,
+              usb_product_id   INTEGER,
+              usb_interface    INTEGER DEFAULT 0,
+              printer_width    INTEGER DEFAULT 576,
+              threshold        INTEGER DEFAULT 100,
+              feed_lines       INTEGER DEFAULT 1,
+              zoom             REAL    DEFAULT 2.0,
+              status           TEXT    DEFAULT 'pending',
+              retry_count      INTEGER DEFAULT 0,
+              last_error       TEXT,
+              created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        ''')
+            """
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_status_created ON print_jobs(status, created_at);"
         )
         conn.commit()
 
+@app.route("/hello", methods=["GET"])
+def hello_api():
+    return jsonify({"message": "HELLO FROM POS PRINTER BRIDGE"})
+
 @app.route("/print-pdf", methods=["POST"])
 def queue_print():
     file = request.files.get("file")
-    host = request.form.get("host")
-    port = request.form.get("port")
-    if not file or not host or not port:
-        return jsonify({"error": "Missing file, host or port"}), 400
+    conn_type = request.form.get("connection_type")
+    if not file or conn_type not in ("network", "usb"):
+        return jsonify({"error": "Missing file or invalid connection_type"}), 400
 
-    try:
-        port = int(port)
-    except ValueError:
-        return jsonify({"error": "Invalid port"}), 400
-
+    # Save uploaded PDF
     filename = secure_filename(file.filename)
     unique_id = uuid.uuid4().hex
     save_path = os.path.join(PDF_DIR, f"{unique_id}_{filename}")
     file.save(save_path)
 
+    # Shared print options
     printer_width = int(request.form.get("printer_width", 576))
     threshold = int(request.form.get("threshold", 100))
     feed_lines = int(request.form.get("feed_lines", 1))
     zoom = float(request.form.get("zoom", 2.0))
 
-    # Insert job record
+    # Connection-specific parameters
+    host = port = usb_vendor_id = usb_product_id = usb_interface = None
+
+    if conn_type == "network":
+        host = request.form.get("host")
+        port = request.form.get("port")
+        if not host or not port:
+            return jsonify({"error": "Missing host or port"}), 400
+        try:
+            port = int(port)
+        except ValueError:
+            return jsonify({"error": "Invalid port"}), 400
+    else:
+        vid = request.form.get("usb_vendor_id")
+        pid = request.form.get("usb_product_id")
+        iface = request.form.get("usb_interface", "0")
+        if not vid or not pid:
+            return jsonify({"error": "Missing USB vendor_id or product_id"}), 400
+        try:
+            usb_vendor_id = int(vid, 16)
+            usb_product_id = int(pid, 16)
+            usb_interface = int(iface)
+        except ValueError:
+            return jsonify({"error": "Invalid USB IDs or interface"}), 400
+
     with sqlite3.connect(DB_PATH, check_same_thread=False) as conn:
         conn.execute(
             """
-            INSERT INTO print_jobs 
-              (file_path, printer_ip, printer_port, printer_width, threshold, feed_lines, zoom)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO print_jobs (
+                file_path,
+                connection_type,
+                printer_ip, printer_port,
+                usb_vendor_id, usb_product_id, usb_interface,
+                printer_width, threshold, feed_lines, zoom
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (save_path, host, port, printer_width, threshold, feed_lines, zoom)
+            (
+                save_path,
+                conn_type,
+                host,
+                port,
+                usb_vendor_id,
+                usb_product_id,
+                usb_interface,
+                printer_width,
+                threshold,
+                feed_lines,
+                zoom,
+            ),
         )
         conn.commit()
 
-    # Signal the worker thread that a new job is available
     new_job_event.set()
     return jsonify({"message": "Print job queued"}), 202
 
 
 def printer_worker():
-    # Single persistent connection for reads
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
 
     while True:
-        # Wait until new job arrives or short timeout
         new_job_event.wait(timeout=0.2)
         new_job_event.clear()
 
-        # Process all pending jobs
         while True:
-            cur = conn.execute(
-                "SELECT * FROM print_jobs WHERE status='pending' ORDER BY created_at LIMIT 1"
-            )
-            job = cur.fetchone()
-
+            job = conn.execute(
+                """
+                SELECT * FROM print_jobs
+                WHERE
+                  (status='pending')
+                  OR
+                  (status='failed' AND retry_count < ?)
+                ORDER BY created_at
+                LIMIT 1
+                """, (MAX_RETRIES,)
+            ).fetchone()
             if not job:
                 break
 
             job_id = job["id"]
-            file_path = job["file_path"]
-            print(f"[INFO] Found job #{job_id}")
+            conn.execute(
+                "UPDATE print_jobs SET status='printing' WHERE id=?", (job_id,)
+            )
+            conn.commit()
 
-            if not os.path.exists(file_path):
-                print(f"[WARN] File not found for job #{job_id}, removing job")
+            try:
+                if job["connection_type"] == "network":
+                    printer.print_pdf_on_thermal_network(
+                        pdf_path=job["file_path"],
+                        printer_ip=job["printer_ip"],
+                        printer_port=job["printer_port"],
+                        printer_width=job["printer_width"],
+                        threshold=job["threshold"],
+                        feed_lines=job["feed_lines"],
+                        zoom=job["zoom"],
+                    )
+                else:
+                    printer.print_pdf_on_thermal_usb(
+                        pdf_path=job["file_path"],
+                        usb_vendor_id=job["usb_vendor_id"],
+                        usb_product_id=job["usb_product_id"],
+                        usb_interface=job["usb_interface"],
+                        printer_width=job["printer_width"],
+                        threshold=job["threshold"],
+                        feed_lines=job["feed_lines"],
+                        zoom=job["zoom"],
+                    )
+
+                try:
+                    os.remove(job["file_path"])
+                except OSError:
+                    print(f"[WARN] Could not delete file {job['file_path']}")
                 conn.execute("DELETE FROM print_jobs WHERE id=?", (job_id,))
                 conn.commit()
-                continue
 
-            print(f"[INFO] Starting print job #{job_id}: {file_path}")
-            conn.execute("UPDATE print_jobs SET status='printing' WHERE id=?", (job_id,))
-            conn.commit()
-
-            try:
-                printer.print_pdf_on_thermal(
-                    pdf_path=file_path,
-                    printer_ip=job["printer_ip"],
-                    printer_port=job["printer_port"],
-                    printer_width=job["printer_width"],
-                    threshold=job["threshold"],
-                    feed_lines=job["feed_lines"],
-                    zoom=job["zoom"]
+            except Exception as e:
+                err = str(e)
+                conn.execute(
+                    """
+                    UPDATE print_jobs
+                       SET
+                         status = CASE
+                                    WHEN retry_count+1 < ? THEN 'pending'
+                                    ELSE 'failed'
+                                  END,
+                         retry_count = retry_count + 1,
+                         last_error = ?
+                     WHERE id = ?
+                    """, (MAX_RETRIES, err, job_id)
                 )
-                print(f"[INFO] Print job #{job_id} completed successfully.")
-            except Exception as e:
-                print(f"[ERROR] Print job #{job_id} failed: {e}")
+                conn.commit()
+                time.sleep(2)
 
-            # Cleanup file and record
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                print(f"[WARN] Could not delete file {file_path}: {e}")
-            conn.execute("DELETE FROM print_jobs WHERE id=?", (job_id,))
-            conn.commit()
 
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=printer_worker, daemon=True).start()
-
-    parser = argparse.ArgumentParser(
-        description="Start Flask app with dynamic port."
-    )
-    parser.add_argument(
-        '--port', type=int, default=5000,
-        help='Port to run the Flask server on'
-    )
-    args = parser.parse_args()
-    app.run(
-        debug=False,
-        port=args.port,
-        host="0.0.0.0",
-        threaded=True
-    )
-
-
-# -----------------------------------------
-# 5. CURL TEST COMMAND
-# -----------------------------------------
-# curl -X POST http://localhost:5000/print-pdf \
-#   -F "file=@./test.pdf" \
-#   -F "host=192.168.0.87" \
-#   -F "port=9100" \
-#   -F "printer_width=576" \
-#   -F "threshold=100" \
-#   -F "feed_lines=1"
+    port = int(os.environ.get("POS_PRINTER_BRIDGE_PORT", 5000))
+    app.run(debug=False, port=port, host="0.0.0.0", threaded=True)
