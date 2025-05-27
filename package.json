@@ -7,6 +7,9 @@
     "@types/escpos": "^2.5.5",
     "@types/pdfkit": "^0.13.9"
   },
+  "scripts": {
+    "release": "gcc pos-printer.c -o bin/pos-printer"
+  },
   "peerDependencies": {
     "typescript": "^5.0.0"
   },

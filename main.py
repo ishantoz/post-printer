@@ -159,7 +159,8 @@ def printer_worker():
                 "UPDATE print_jobs SET status='printing' WHERE id=?", (job_id,)
             )
             conn.commit()
-
+            print('asd')
+            
             try:
                 if job["connection_type"] == "network":
                     printer.print_pdf_on_thermal_network(
