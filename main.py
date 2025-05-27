@@ -159,8 +159,6 @@ def printer_worker():
                 "UPDATE print_jobs SET status='printing' WHERE id=?", (job_id,)
             )
             conn.commit()
-            print('asd')
-            
             try:
                 if job["connection_type"] == "network":
                     printer.print_pdf_on_thermal_network(
@@ -214,4 +212,10 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=printer_worker, daemon=True).start()
     port = int(os.environ.get("POS_PRINTER_BRIDGE_PORT", 5000))
-    app.run(debug=False, port=port, host="0.0.0.0", threaded=True)
+    app.run(
+    debug=False,
+    port=port,
+    host="0.0.0.0",
+    threaded=True,
+    ssl_context=("certs/cert.pem", "certs/key.pem")
+)
