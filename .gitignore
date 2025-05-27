@@ -183,6 +183,7 @@ print_queue.db*
 .DS_Store
 
 
+print_jobs
 
 
 *.db*
